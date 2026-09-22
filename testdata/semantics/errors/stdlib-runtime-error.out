@@ -1,0 +1,4 @@
+<stdlib>/math.ari:64:9: error: Math.max() expects a Float or Int
+          panic("Math.max() expects a Float or Int")
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+--- exit: 1

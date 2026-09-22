@@ -1,0 +1,269 @@
+name: CI
+
+on:
+  # Only master on push. A branch with a PR open is covered by pull_request,
+  # and listening for both ran every one of them twice.
+  #
+  # No paths filter on either trigger, deliberately. A workflow that a path
+  # filter stops from triggering reports no check run at all, and a required
+  # status check waits for it forever -- so the moment master requires these
+  # checks, a docs-only pull request becomes unmergeable. A job skipped by an
+  # `if` does report, as "skipped", which satisfies the requirement. So the
+  # filtering moved from the trigger into the jobs, below.
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to the same branch supersedes the run already in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Which of the jobs below are worth running. A change confined to files
+  # nothing here reads should not pay for six jobs across three platforms, and
+  # this is where that is decided now that the triggers no longer decide it.
+  #
+  # README.md is deliberately not in the list: the language job runs every one
+  # of its code blocks through the interpreter, so it is executable and a change
+  # to it can fail CI. Same for examples/.
+  #
+  # A push to master always runs everything. It is the check after the merge,
+  # it is rare, and making it conditional would only add a way to be wrong.
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      # The API rather than a checkout and a diff: no clone, no fetch-depth to
+      # get wrong, and no third-party action in the supply chain for something
+      # this small.
+      - id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "not a pull request, running everything"
+            exit 0
+          fi
+
+          files="$(gh api "repos/$GH_REPO/pulls/$NUMBER/files" --paginate --jq '.[].filename')"
+          echo "changed:"
+          echo "$files" | sed 's/^/  /'
+
+          # Anything outside the ignorable set means run everything. Written as
+          # "is there a file that is not ignorable" rather than the inverse, so
+          # an unfamiliar path is treated as code and the jobs run.
+          if echo "$files" | grep -qvE '^(docs/|CLAUDE\.md$|LICENSE$)'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "documentation only, skipping the rest"
+          fi
+
+  # The Go side, on every platform we ship a binary for.
+  test:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          # go.mod is the single source of truth for the toolchain version.
+          go-version-file: go.mod
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+      # gofmt only on Linux: git on the Windows runner checks out CRLF, which
+      # gofmt reports as a diff in every file.
+      - name: gofmt
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would rewrite:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # One iteration each, which measures nothing and is not meant to. It
+      # proves the benchmarks still compile and still run, so they cannot rot
+      # into something that fails the first time somebody reaches for them --
+      # which is always while chasing a regression and never at a good moment.
+      #
+      # Nothing here compares numbers. Wall-clock on a shared runner is noise,
+      # and gating on it would need a stored baseline that goes stale. Comparing
+      # revisions is a local benchstat job; see internal/interp/bench_test.go.
+      - name: Benchmarks run
+        if: matrix.os == 'ubuntu-latest'
+        run: go test ./internal/interp/ -run=XXX -bench=. -benchtime=1x
+
+  # Static analysis beyond `go vet`. Ubuntu only: the linters are
+  # platform-independent, and running them three times says the same thing
+  # three times.
+  #
+  # This replaces the Go Report Card badge the README used to carry. That
+  # service is retired -- its badge now renders the word "retired" -- and its
+  # own site points at golangci-lint instead.
+  lint:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # The linter version is pinned, unlike the actions above. A new
+      # golangci-lint release can add checks, and a green branch turning red
+      # because a tool updated overnight is not a signal about this repo.
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.13.1
+
+      # Known vulnerabilities in the dependencies, and in the toolchain itself.
+      # Unpinned on purpose, unlike golangci-lint above: the reason to pin a
+      # linter is that a new check turning a branch red says nothing about this
+      # repo, and the reverse is true here -- a new finding is exactly a fact
+      # about this repo that nobody knew yesterday. govulncheck also reports
+      # only what is actually reachable from this code, so a vulnerability in an
+      # unused corner of a dependency does not stop the build.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  # The language side. Ubuntu only: both scripts need bash 4 (mapfile) and GNU
+  # coreutils (timeout), and the macOS runner ships bash 3.2 with neither.
+  language:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: language
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # Both scripts build their own interpreter, but building it once here
+      # keeps them from doing it twice and puts a compile error in its own step.
+      - name: Build the interpreter
+        run: go build -o aria .
+
+      - name: Characterization suite
+        run: bash scripts/characterize.sh verify
+
+      - name: README code blocks
+        run: bash scripts/check-readme.sh
+
+      - name: Examples
+        run: bash scripts/check-examples.sh
+
+      # Adding a suite here means adding it to the release workflow's `verify`
+      # job too. Nothing enforces that the two agree, and the last time they
+      # drifted it was this step that was missing from a release.
+
+  # Cheap, and both targets have found real bugs. 30s each, as in CLAUDE.md.
+  fuzz:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # Any failure fails the job, timeouts included. A parser that hangs on
+      # some input and a runner too busy to shut the coordinator down look
+      # identical from here -- both come back as "context deadline exceeded"
+      # with nothing written -- and non-termination is a bug class this repo
+      # takes seriously enough not to guess about.
+      - name: Fuzz the scanner
+        run: go test ./internal/scanner/ -run=Fuzz -fuzz=FuzzScan -fuzztime=30s
+
+      - name: Fuzz the parser
+        run: go test ./internal/parser/ -run=Fuzz -fuzz=FuzzParse -fuzztime=30s
+
+      # Which of the two it was, without having to download anything. This
+      # only labels the failure; the job is already failing either way.
+      - name: Say which kind of failure it was
+        if: failure()
+        run: |
+          if [ -n "$(find internal -path '*/testdata/fuzz/*' -type f 2>/dev/null)" ]; then
+            echo "::error::a fuzz target found a failing input, attached below as fuzz-corpus"
+          else
+            echo "::warning::no failing input was written, so this is a hang or a loaded runner; re-run to tell them apart"
+          fi
+
+      # A crasher is written to testdata/fuzz, which is gitignored and would
+      # otherwise be thrown away with the runner.
+      - name: Save the failing input
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-corpus
+          path: internal/*/testdata/fuzz/
+          if-no-files-found: ignore
+
+  # One check for branch protection to require, instead of seven.
+  #
+  # Requiring the job names directly has two problems. A skipped matrix job
+  # reports its name unexpanded -- literally "test (${{ matrix.os }})" rather
+  # than the three real ones -- so a required "test (ubuntu-latest)" waits
+  # forever on a documentation change, which is the deadlock the job-level
+  # filtering was meant to avoid in the first place. And every required name is
+  # coupled to a job name: rename a job, and protection silently stops enforcing
+  # it with nothing anywhere to notice.
+  #
+  # This job always runs, so it always reports, and it fails if anything it
+  # gates on failed or was cancelled. Skipped is fine: that is the filtering
+  # working. Require this and nothing else.
+  ci:
+    name: ci
+    if: always()
+    needs: [changes, test, lint, language, fuzz]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check what the other jobs did
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          case " $RESULTS " in
+            *" failure "*|*" cancelled "*)
+              echo "::error::a job this gates on did not pass"
+              exit 1
+              ;;
+          esac
+          echo "all clear"

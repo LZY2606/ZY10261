@@ -1,0 +1,58 @@
+# Built binaries. `aria` has no extension on Unix, so the wildcards below do not
+# cover it.
+/aria
+/aria.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binaries and fuzz corpora. A corpus entry is only useful alongside the
+# failing input it was minimised from, which belongs in a test instead.
+*.test
+**/testdata/fuzz/
+
+# System and IDE files
+.idea
+.vscode
+.DS_STORE
+
+# Scratch files
+source.ari
+
+# --- 依赖与构建产物（不进交付快照）---
+node_modules/
+bower_components/
+.pnp.*
+dist/
+build/
+out/
+target/
+.next/
+.nuxt/
+.svelte-kit/
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+vendor/bundle/
+Pods/
+.gradle/
+.cargo/
+.DS_Store
+.env
+.env.*
+*.log
+coverage/
+.coverage
+.nyc_output/
+.cache/
+.parcel-cache/
+.vite/
+.turbo/
+*.tsbuildinfo

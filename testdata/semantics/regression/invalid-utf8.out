@@ -1,0 +1,4 @@
+invalid-utf8.ari:1:4: error: invalid UTF-8 byte 0x92 in source
+  0.×’’
+     ^
+--- exit: 1

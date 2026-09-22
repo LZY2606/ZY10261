@@ -1,0 +1,15 @@
+var n = 10
+n += 5
+println(n)
+n -= 3
+println(n)
+n *= 2
+println(n)
+n /= 4
+println(n)
+// Compound assignment covered only + - * /, though parseAssign desugars
+// generically, so `a %= 3` was a parse error for no structural reason.
+n %= 3
+println(n)
+n **= 4
+println(n)

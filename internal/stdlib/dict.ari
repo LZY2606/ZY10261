@@ -1,0 +1,130 @@
+module Dict
+  let size = func (dict: Dictionary) -> Int
+    runtime_len(dict)
+  end
+
+  // Through the dictionary's own index, so it agrees with subscript lookup and
+  // costs O(1). It used to walk every entry comparing with Equal, which found
+  // an atom key given the equal string while dict[key] did not — the two
+  // disagreeing about what a key is.
+  let contains? = func (dict: Dictionary, key) -> Bool
+    runtime_has_key(dict, key)
+  end
+
+  let has? = func (dict: Dictionary, key) -> Bool
+    runtime_has_key(dict, key)
+  end
+
+  let empty? = func (dict: Dictionary) -> Bool
+    size(dict) == 0
+  end
+
+  // insert, update and delete answer a tagged result rather than raising.
+  //
+  // A key that is already there, or one that is not, is an ordinary outcome a
+  // caller should be able to handle — and the only way to avoid the old panic
+  // was to duplicate the check before every call. A caller who knows the key's
+  // state can still say so with Result.expect, and one who has a default can
+  // use Result.unwrap. See docs/architecture.md.
+  //
+  // The check goes through the index, not `dict[key] != nil`: a key whose value
+  // is nil exists.
+  let insert = func (dict: Dictionary, key, value) -> Array
+    if has?(dict, key)
+      return Result.error("Dictionary key '" + String(key) + "' already exists")
+    end
+
+    Result.ok(dict + [key => value])
+  end
+
+  let update = func (dict: Dictionary, key, value) -> Array
+    if !has?(dict, key)
+      return Result.error("Dictionary key '" + String(key) + "' doesn't exist")
+    end
+
+    Result.ok(dict + [key => value])
+  end
+
+  let delete = func (dict: Dictionary, key) -> Array
+    if !has?(dict, key)
+      return Result.error("Dictionary key '" + String(key) + "' doesn't exist")
+    end
+
+    var purged = [=>]
+    for k, v in dict
+      if k != key
+        purged[k] = v
+      end
+    end
+    Result.ok(purged)
+  end
+
+  let keys = func (dict: Dictionary) -> Array
+    var out = []
+    for k, v in dict
+      out[] = k
+    end
+    out
+  end
+
+  let values = func (dict: Dictionary) -> Array
+    var out = []
+    for k, v in dict
+      out[] = v
+    end
+    out
+  end
+
+  // get answers the fallback when the key is absent, which `dict[key]` cannot
+  // distinguish from a key whose value is nil. `default` is a keyword, hence
+  // the name.
+  let get = func (dict: Dictionary, key, fallback = nil)
+    if has?(dict, key)
+      return dict[key]
+    end
+    fallback
+  end
+
+  let merge = func (first: Dictionary, second: Dictionary) -> Dictionary
+    first + second
+  end
+
+  // fn receives the key and the value and answers the new value; the keys are
+  // the dictionary's own.
+  let map = func (dict: Dictionary, fn: Function) -> Dictionary
+    var out = [=>]
+    for k, v in dict
+      out[k] = fn(k, v)
+    end
+    out
+  end
+
+  let filter = func (dict: Dictionary, fn: Function) -> Dictionary
+    var out = [=>]
+    for k, v in dict
+      if fn(k, v)
+        out[k] = v
+      end
+    end
+    out
+  end
+
+  let toPairs = func (dict: Dictionary) -> Array
+    var out = []
+    for k, v in dict
+      out[] = [k, v]
+    end
+    out
+  end
+
+  let fromPairs = func (pairs: Array) -> Dictionary
+    var out = [=>]
+    for pair in pairs
+      if !(pair is Array) || Enum.size(pair) != 2
+        panic("Dict.fromPairs() expects an array of [key, value] pairs")
+      end
+      out[pair[0]] = pair[1]
+    end
+    out
+  end
+end
