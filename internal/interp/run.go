@@ -36,8 +36,15 @@ type Options struct {
 // evaluated until the whole file has parsed and resolved, so a name error in a
 // branch that never executes is still reported.
 func Run(file *source.File, opts Options) bool {
+	_, ok := Load(file, opts)
+	return ok
+}
+
+// Load is Run with the interpreter handed back, so the caller can inspect the
+// module graph and cache the run built.
+func Load(file *source.File, opts Options) (*Interp, bool) {
 	if opts.Out == nil || opts.Err == nil {
-		panic("interp.Run: Out and Err are required")
+		panic("interp.Load: Out and Err are required")
 	}
 
 	bag := diag.New(file)
@@ -45,7 +52,7 @@ func Run(file *source.File, opts Options) bool {
 	prog := parser.New(file, bag).Parse()
 	if bag.HasErrors() {
 		fmt.Fprint(opts.Err, bag.Render())
-		return false
+		return nil, false
 	}
 
 	i := New(file, nil)
@@ -58,13 +65,13 @@ func Run(file *source.File, opts Options) bool {
 	// branch-checked on every single AST node.
 	if !opts.NoStdlib {
 		if !i.loadStdlib(opts.Err) {
-			return false
+			return i, false
 		}
 	}
 
-	units, info, ok := i.compile(file, prog, bag, opts.Err)
+	units, cachedAliases, info, ok := i.compile(file, prog, bag, opts.Err)
 	if !ok {
-		return false
+		return i, false
 	}
 	i.info = info
 
@@ -80,13 +87,13 @@ func Run(file *source.File, opts Options) bool {
 
 	// Imported units run before the file that imported them, which is the order
 	// their names became visible in.
-	if err := i.evalUnits(units); err != nil {
-		return report(err)
+	if err := i.evalUnits(units, cachedAliases); err != nil {
+		return i, report(err)
 	}
 	if _, err := i.Run(prog); err != nil {
-		return report(err)
+		return i, report(err)
 	}
-	return true
+	return i, true
 }
 
 // Check compiles file without evaluating it, reporting into Options.Err.
@@ -114,7 +121,7 @@ func Check(file *source.File, opts Options) bool {
 		return false
 	}
 
-	_, _, ok := i.compile(file, prog, bag, opts.Err)
+	_, _, _, ok := i.compile(file, prog, bag, opts.Err)
 	return ok
 }
 
@@ -164,7 +171,8 @@ func (i *Interp) loadStdlib(errOut io.Writer) bool {
 			file: file, info: nil,
 			Out: i.Out, Err: i.Err, In: i.In,
 			globals: i.globals, modules: i.modules,
-			dir: ".", imported: i.imported,
+			dir:   ".",
+			graph: i.graph, cache: i.cache, aliasSource: i.aliasSource,
 		}
 		if _, err := sub.Run(prog); err != nil {
 			var re *Error
@@ -210,13 +218,13 @@ func Eval(name, src string, opts Options) (value.Value, error) {
 	}
 
 	var sink discard
-	units, info, ok := i.compile(file, prog, bag, &sink)
+	units, cachedAliases, info, ok := i.compile(file, prog, bag, &sink)
 	if !ok {
 		return nil, fmt.Errorf("%s", sink.String())
 	}
 	i.info = info
 
-	if err := i.evalUnits(units); err != nil {
+	if err := i.evalUnits(units, cachedAliases); err != nil {
 		return nil, err
 	}
 	return i.Run(prog)
@@ -272,6 +280,13 @@ func (s *Session) Declared() []string {
 	sort.Strings(out)
 	return out
 }
+
+// Graph exposes the session's module graph, so a caller can inspect what each
+// line pulled in and how it ended.
+func (s *Session) Graph() *ModuleGraph { return s.interp.graph }
+
+// Cache exposes the session's module cache.
+func (s *Session) Cache() *ModuleCache { return s.interp.cache }
 
 // Modules lists the modules in scope, standard library included.
 func (s *Session) Modules() []string {
@@ -335,7 +350,7 @@ func (s *Session) Eval(src string) (value.Value, error) {
 		return nil, fmt.Errorf("%s", strings.TrimRight(bag.Render(), "\n"))
 	}
 
-	units, loaded := loadUnits(file, prog, bag)
+	units, cachedAliases, loaded := s.interp.loadUnits(file, prog, bag)
 	if !loaded {
 		return nil, fmt.Errorf("%s", strings.TrimRight(unitErrors(units, bag), "\n"))
 	}
@@ -350,6 +365,11 @@ func (s *Session) Eval(src string) (value.Value, error) {
 	// A module declared on an earlier line is still declared, and its members
 	// are known, so an access to one is checked like any other.
 	s.interp.predeclareModules(r)
+	for _, ca := range cachedAliases {
+		if entry, ok := s.interp.cache.get(ca.id); ok {
+			r.PredeclareModule(ca.alias, entry.order...)
+		}
+	}
 
 	for _, u := range units {
 		if u.alias != "" {
@@ -360,13 +380,24 @@ func (s *Session) Eval(src string) (value.Value, error) {
 	}
 	info := r.Resolve(prog)
 	if msg := unitErrors(units, bag); msg != "" {
+		for _, u := range units {
+			if u.bag.HasErrors() {
+				s.interp.graph.fail(u.id, &ImportError{
+					Kind: ImportErrResolve, ID: u.id, Span: u.importSpan, Importer: u.importer,
+					Msg: "module failed to resolve",
+				})
+			}
+		}
 		return nil, fmt.Errorf("%s", strings.TrimRight(msg, "\n"))
+	}
+	for _, u := range units {
+		s.interp.graph.setState(u.id, ModuleResolved)
 	}
 
 	s.interp.file = file
 	s.interp.info = info
 
-	if err := s.interp.evalUnits(units); err != nil {
+	if err := s.interp.evalUnits(units, cachedAliases); err != nil {
 		return nil, err
 	}
 
@@ -401,16 +432,17 @@ func (s *Session) Eval(src string) (value.Value, error) {
 	return v, nil
 }
 
-// compile parses the import graph and resolves the whole of it as one unit of
-// compilation, returning the imported units in the order they have to run.
+// compile builds the candidate module graph and resolves the whole of it as
+// one unit of compilation, returning the imported units in the order they have
+// to run.
 //
 // It writes any diagnostic out itself, since a unit carries its own bag and that
 // is what renders a message against its own text.
-func (i *Interp) compile(file *source.File, prog *ast.Program, bag *diag.Bag, errOut io.Writer) ([]unit, *resolver.Info, bool) {
-	units, loaded := loadUnits(file, prog, bag)
+func (i *Interp) compile(file *source.File, prog *ast.Program, bag *diag.Bag, errOut io.Writer) ([]unit, []cachedAlias, *resolver.Info, bool) {
+	units, cachedAliases, loaded := i.loadUnits(file, prog, bag)
 	if !loaded {
 		fmt.Fprint(errOut, unitErrors(units, bag))
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 
 	// Globals first, then modules: predeclaring a name replaces its binding, and
@@ -421,6 +453,15 @@ func (i *Interp) compile(file *source.File, prog *ast.Program, bag *diag.Bag, er
 		r.Predeclare(name)
 	}
 	i.predeclareModules(r)
+
+	// An alias over a module an earlier execution cached is declared from the
+	// cache: the module is not resolved again, but the resolver still has to
+	// know the name and its members.
+	for _, ca := range cachedAliases {
+		if entry, ok := i.cache.get(ca.id); ok {
+			r.PredeclareModule(ca.alias, entry.order...)
+		}
+	}
 
 	// Units come in the order their names have to become visible, so resolving
 	// them in order into the same scope is all it takes.
@@ -434,8 +475,28 @@ func (i *Interp) compile(file *source.File, prog *ast.Program, bag *diag.Bag, er
 	info := r.Resolve(prog)
 
 	if msg := unitErrors(units, bag); msg != "" {
+		// A resolution failure is categorized on the node it belongs to, so
+		// the graph answers which module failed without re-reading the
+		// rendered diagnostics.
+		for _, u := range units {
+			if u.bag.HasErrors() {
+				i.graph.fail(u.id, &ImportError{
+					Kind: ImportErrResolve, ID: u.id, Span: u.importSpan, Importer: u.importer,
+					Msg: "module failed to resolve",
+				})
+			}
+		}
+		if bag.HasErrors() {
+			i.graph.fail(ModuleID(file.Name), &ImportError{
+				Kind: ImportErrResolve, ID: ModuleID(file.Name), Importer: file,
+				Msg: "module failed to resolve",
+			})
+		}
 		fmt.Fprint(errOut, msg)
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
-	return units, info, true
+	for _, u := range units {
+		i.graph.setState(u.id, ModuleResolved)
+	}
+	return units, cachedAliases, info, true
 }

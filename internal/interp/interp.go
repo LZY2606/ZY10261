@@ -108,8 +108,16 @@ type Interp struct {
 	records map[string]*RecordDef
 	// dir is where relative imports resolve from.
 	dir string
-	// imported guards against re-importing, matching the original's cache.
-	imported map[string]bool
+	// graph is the module graph of every top-level execution this Interp has
+	// run, accumulated so a caller can inspect nodes, edges, states and cycle
+	// paths after a run.
+	graph *ModuleGraph
+	// cache holds the exports of modules that evaluated successfully. It is
+	// per-Interp, so concurrent sessions never share initialization state.
+	cache *ModuleCache
+	// aliasSource maps an alias to the canonical id of the module it names,
+	// so one alias cannot come to name two different sources.
+	aliasSource map[string]string
 	// args is what the program was told, everything after the source file.
 	args []string
 
@@ -142,15 +150,17 @@ type frame struct {
 // New returns an interpreter writing to stdout and stderr.
 func New(file *source.File, info *resolver.Info) *Interp {
 	i := &Interp{
-		file:     file,
-		info:     info,
-		Out:      os.Stdout,
-		Err:      os.Stderr,
-		In:       os.Stdin,
-		globals:  newEnv(nil),
-		modules:  map[string]*Module{},
-		records:  map[string]*RecordDef{},
-		imported: map[string]bool{},
+		file:        file,
+		info:        info,
+		Out:         os.Stdout,
+		Err:         os.Stderr,
+		In:          os.Stdin,
+		globals:     newEnv(nil),
+		modules:     map[string]*Module{},
+		records:     map[string]*RecordDef{},
+		graph:       newModuleGraph(),
+		cache:       newModuleCache(),
+		aliasSource: map[string]string{},
 	}
 	i.dir = filepath.Dir(file.Name)
 	i.installBuiltins()
@@ -163,6 +173,14 @@ func (i *Interp) Globals() *env { return i.globals }
 // Modules exposes declared modules, so a standard library evaluated separately
 // can be carried into a later run.
 func (i *Interp) Modules() map[string]*Module { return i.modules }
+
+// Graph exposes the module graph the runs of this Interp have built, so a
+// caller can inspect nodes, edges, states and cycle paths.
+func (i *Interp) Graph() *ModuleGraph { return i.graph }
+
+// Cache exposes the module export cache, so a caller can see which modules
+// published exports and what those exports are.
+func (i *Interp) Cache() *ModuleCache { return i.cache }
 
 // Run evaluates prog. It returns the program's final value, or an error if a
 // runtime failure stopped it.

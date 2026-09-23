@@ -142,12 +142,12 @@ func prepare(tb testing.TB, name, src string) prepared {
 	if !i.loadStdlib(&sink) {
 		tb.Fatalf("%s: standard library failed to load: %s", name, sink.String())
 	}
-	units, info, ok := i.compile(file, prog, bag, &sink)
+	units, cachedAliases, info, ok := i.compile(file, prog, bag, &sink)
 	if !ok {
 		tb.Fatalf("%s: %s", name, sink.String())
 	}
 	i.info = info
-	if err := i.evalUnits(units); err != nil {
+	if err := i.evalUnits(units, cachedAliases); err != nil {
 		tb.Fatalf("%s: %v", name, err)
 	}
 	return prepared{interp: i, prog: prog}
@@ -222,7 +222,7 @@ func BenchmarkResolve(b *testing.B) {
 				}
 				b.StartTimer()
 
-				if _, _, ok := i.compile(file, prog, bag, &sink); !ok {
+				if _, _, _, ok := i.compile(file, prog, bag, &sink); !ok {
 					b.Fatalf("%s", sink.String())
 				}
 			}
